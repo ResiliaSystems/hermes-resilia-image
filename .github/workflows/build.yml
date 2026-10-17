@@ -1,0 +1,69 @@
+name: build-hermes-resilia
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_tag:
+        description: "Tag upstream Hermes (ex. v0.22.2)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Résoudre l'image de base
+        id: base
+        run: |
+          set -euo pipefail
+          TAG="${{ inputs.base_tag }}"
+          docker pull "nousresearch/hermes-agent:${TAG}" >/dev/null
+          DIGEST="$(docker image inspect "nousresearch/hermes-agent:${TAG}" --format '{{index .RepoDigests 0}}' | cut -d@ -f2)"
+          PYVER="$(docker run --rm --entrypoint python "nousresearch/hermes-agent:${TAG}" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "pyver=${PYVER}" >> "$GITHUB_OUTPUT"
+          echo "Base ${TAG} @ ${DIGEST} (Python ${PYVER})"
+
+      - name: Construire l'image dérivée
+        env:
+          IMAGE: ghcr.io/${{ github.repository }}
+        run: |
+          set -euo pipefail
+          IMAGE_LC="$(echo "${IMAGE}" | tr '[:upper:]' '[:lower:]')"
+          echo "IMAGE_LC=${IMAGE_LC}" >> "$GITHUB_ENV"
+          docker build \
+            --build-arg BASE_IMAGE="nousresearch/hermes-agent:${{ inputs.base_tag }}@${{ steps.base.outputs.digest }}" \
+            --build-arg PYTHON_VERSION="${{ steps.base.outputs.pyver }}" \
+            -t "${IMAGE_LC}:${{ inputs.base_tag }}" .
+
+      - name: Vérifier les dépendances Hindsight
+        run: |
+          set -euo pipefail
+          docker run --rm --entrypoint /opt/hermes/.venv/bin/python \
+            "${IMAGE_LC}:${{ inputs.base_tag }}" \
+            -c 'import hindsight_client, hindsight_embed; print("HINDSIGHT_DEPS_OK")'
+
+      - name: Publier sur GHCR
+        run: |
+          set -euo pipefail
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          docker push "${IMAGE_LC}:${{ inputs.base_tag }}"
+          DIGEST="$(docker image inspect "${IMAGE_LC}:${{ inputs.base_tag }}" --format '{{index .RepoDigests 0}}' | cut -d@ -f2)"
+          echo "IMAGE=${IMAGE_LC}:${{ inputs.base_tag }}@${DIGEST}" >> "$GITHUB_STEP_SUMMARY"
+          echo "DIGEST=${DIGEST}" >> "$GITHUB_STEP_SUMMARY"
+          echo "Ligne Compose à utiliser :"
+          echo "image: ${IMAGE_LC}:${{ inputs.base_tag }}@${DIGEST}"
+
+      - name: Rendre le paquet public (première publication)
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api --method PATCH "/user/packages/container/$(echo '${{ github.event.repository.name }}' | tr '[:upper:]' '[:lower:]')" \
+            -f visibility=public || echo "À faire manuellement dans Settings → Packages si le paquet reste privé."
