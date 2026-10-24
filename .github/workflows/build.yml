@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       base_tag:
-        description: "Tag upstream Hermes (ex. v0.22.2)"
+        description: "Tag upstream Hermes (ex. v0.22.5)"
         required: true
         type: string
 
