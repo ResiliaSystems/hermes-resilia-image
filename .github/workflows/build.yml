@@ -1,36 +1,76 @@
 name: build-hermes-resilia
-
+# Deux modes :
+#   - manuel : champ base_tag rempli, comportement identique a avant ;
+#   - automatique : chaque nuit a 04:00 UTC, detecte la derniere version stable
+#     sur Docker Hub et construit l'image derivee si elle n'existe pas encore.
+#     Le depot GHCR contient donc toujours l'image de la derniere version,
+#     et une mise a jour Hermes se resume a changer une ligne dans Komodo.
 on:
   workflow_dispatch:
     inputs:
       base_tag:
-        description: "Tag upstream Hermes (ex. v0.22.5)"
-        required: true
+        description: "Tag upstream Hermes (vide = derniere version stable detectee)"
+        required: false
         type: string
-
+      force:
+        description: "Reconstruire meme si l'image existe deja"
+        required: false
+        type: boolean
+        default: false
+  schedule:
+    - cron: "0 4 * * *"
 permissions:
   contents: read
   packages: write
-
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Résoudre l'image de base
-        id: base
+      - name: Determiner le tag cible
+        id: tag
         run: |
           set -euo pipefail
           TAG="${{ inputs.base_tag }}"
+          if [ -z "$TAG" ]; then
+            TAG="$(curl -s 'https://hub.docker.com/v2/repositories/nousresearch/hermes-agent/tags?page_size=100&ordering=last_updated' \
+              | jq -r '.results[].name' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -1)"
+          fi
+          if [ -z "$TAG" ]; then
+            echo "Aucun tag stable detecte sur Docker Hub"
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Tag cible : $TAG"
+      - name: Image deja publiee ?
+        id: exists
+        run: |
+          set -euo pipefail
+          REPO="$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')"
+          TOKEN="$(curl -s "https://ghcr.io/token?scope=repository:${REPO}:pull&service=ghcr.io" | jq -r .token)"
+          CODE="$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer ${TOKEN}" \
+            "https://ghcr.io/v2/${REPO}/manifests/${{ steps.tag.outputs.tag }}")"
+          echo "reponse_ghcr=${CODE}"
+          if [ "$CODE" = "200" ] && [ "${{ inputs.force }}" != "true" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "Image deja presente : rien a construire."
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Resoudre l'image de base
+        if: steps.exists.outputs.skip == 'false'
+        id: base
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.tag.outputs.tag }}"
           docker pull "nousresearch/hermes-agent:${TAG}" >/dev/null
           DIGEST="$(docker image inspect "nousresearch/hermes-agent:${TAG}" --format '{{index .RepoDigests 0}}' | cut -d@ -f2)"
           PYVER="$(docker run --rm --entrypoint python "nousresearch/hermes-agent:${TAG}" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
           echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
           echo "pyver=${PYVER}" >> "$GITHUB_OUTPUT"
           echo "Base ${TAG} @ ${DIGEST} (Python ${PYVER})"
-
-      - name: Construire l'image dérivée
+      - name: Construire l'image derivee
+        if: steps.exists.outputs.skip == 'false'
         env:
           IMAGE: ghcr.io/${{ github.repository }}
         run: |
@@ -38,32 +78,32 @@ jobs:
           IMAGE_LC="$(echo "${IMAGE}" | tr '[:upper:]' '[:lower:]')"
           echo "IMAGE_LC=${IMAGE_LC}" >> "$GITHUB_ENV"
           docker build \
-            --build-arg BASE_IMAGE="nousresearch/hermes-agent:${{ inputs.base_tag }}@${{ steps.base.outputs.digest }}" \
+            --build-arg BASE_IMAGE="nousresearch/hermes-agent:${{ steps.tag.outputs.tag }}@${{ steps.base.outputs.digest }}" \
             --build-arg PYTHON_VERSION="${{ steps.base.outputs.pyver }}" \
-            -t "${IMAGE_LC}:${{ inputs.base_tag }}" .
-
-      - name: Vérifier les dépendances Hindsight
+            -t "${IMAGE_LC}:${{ steps.tag.outputs.tag }}" .
+      - name: Verifier les dependances Hindsight
+        if: steps.exists.outputs.skip == 'false'
         run: |
           set -euo pipefail
           docker run --rm --entrypoint /opt/hermes/.venv/bin/python \
-            "${IMAGE_LC}:${{ inputs.base_tag }}" \
+            "${IMAGE_LC}:${{ steps.tag.outputs.tag }}" \
             -c 'import hindsight_client, hindsight_embed; print("HINDSIGHT_DEPS_OK")'
-
       - name: Publier sur GHCR
+        if: steps.exists.outputs.skip == 'false'
         run: |
           set -euo pipefail
           echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
-          docker push "${IMAGE_LC}:${{ inputs.base_tag }}"
-          DIGEST="$(docker image inspect "${IMAGE_LC}:${{ inputs.base_tag }}" --format '{{index .RepoDigests 0}}' | cut -d@ -f2)"
-          echo "IMAGE=${IMAGE_LC}:${{ inputs.base_tag }}@${DIGEST}" >> "$GITHUB_STEP_SUMMARY"
+          docker push "${IMAGE_LC}:${{ steps.tag.outputs.tag }}"
+          DIGEST="$(docker image inspect "${IMAGE_LC}:${{ steps.tag.outputs.tag }}" --format '{{index .RepoDigests 0}}' | cut -d@ -f2)"
+          echo "IMAGE=${IMAGE_LC}:${{ steps.tag.outputs.tag }}@${DIGEST}" >> "$GITHUB_STEP_SUMMARY"
           echo "DIGEST=${DIGEST}" >> "$GITHUB_STEP_SUMMARY"
-          echo "Ligne Compose à utiliser :"
-          echo "image: ${IMAGE_LC}:${{ inputs.base_tag }}@${DIGEST}"
-
-      - name: Rendre le paquet public (première publication)
+          echo "Ligne Compose a utiliser :"
+          echo "image: ${IMAGE_LC}:${{ steps.tag.outputs.tag }}@${DIGEST}"
+      - name: Rendre le paquet public (premiere publication)
+        if: steps.exists.outputs.skip == 'false'
         continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh api --method PATCH "/user/packages/container/$(echo '${{ github.event.repository.name }}' | tr '[:upper:]' '[:lower:]')" \
-            -f visibility=public || echo "À faire manuellement dans Settings → Packages si le paquet reste privé."
+            -f visibility=public || echo "A verifier manuellement dans Settings -> Packages."
